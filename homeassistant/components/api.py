@@ -30,6 +30,8 @@ DEPENDENCIES = ['http']
 STREAM_PING_PAYLOAD = "ping"
 STREAM_PING_INTERVAL = 50  # seconds
 
+WS_EVENT_FORMAT = "event:{}"
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -50,7 +52,62 @@ def setup(hass, config):
     hass.wsgi.register_view(APIErrorLogView)
     hass.wsgi.register_view(APITemplateView)
 
+    hass.wsgi.register_wsgi_app('/api/websocket', WebSockets(hass).handle)
+
     return True
+
+
+class WebSockets:
+    """View to handle Status requests."""
+
+    def __init__(self, hass):
+        from eventlet import websocket
+
+        self.hass = hass
+        self.connections = set()
+        self.handle = websocket.WebSocketWSGI(self.handle)
+
+    def handle(self, ws):
+        """Retrieve if API is running."""
+        self.connections.add(ws)
+        _LOGGER.debug('Websocket %s connection opened', id(ws))
+
+        events = set()
+
+        def event_listener(event):
+            """Event listener for ws."""
+            if event.event_type not in events:
+                return
+
+            msg = WS_EVENT_FORMAT.format(json.dumps(
+                event,
+                sort_keys=True,
+                cls=rem.JSONEncoder
+            ))
+            _LOGGER.debug('Websocket %s writing event %s', id(ws), msg)
+            ws.send(msg)
+
+        try:
+            while True:
+                msg = ws.wait()
+                if msg is None:
+                    break
+
+                if msg.startswith('event:subscribe:'):
+                    event_type = msg[16:]
+                    events.add(event_type)
+                    _LOGGER.debug('Websocket %s subscribing event %s', id(ws),
+                                  event_type)
+                    if len(events) == 1:
+                        _LOGGER.debug('Websocket %s attaching event listener',
+                                      id(ws))
+                        self.hass.bus.listen(MATCH_ALL, event_listener)
+        finally:
+            _LOGGER.debug('Websocket %s connection closed', id(ws))
+            if events:
+                _LOGGER.debug('Websocket %s removing event listener', id(ws))
+                self.hass.bus.remove_listener(MATCH_ALL, event_listener)
+            self.connections.remove(ws)
 
 
 class APIStatusView(HomeAssistantView):
@@ -82,7 +139,7 @@ class APIEventStream(HomeAssistantView):
 
         restrict = request.args.get('restrict')
         if restrict:
-            restrict = restrict.split(',')
+            restrict = set(restrict.split(','))
 
         def thread_forward_events(event):
             """Forward events to the open request."""
